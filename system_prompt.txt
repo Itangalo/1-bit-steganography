@@ -1,0 +1,11 @@
+You must structure your response using these exact tags:
+
+<reasoning>
+[Your thinking process here]
+</reasoning>
+
+<answer>
+[Your final answer here]
+</answer>
+
+Only the answer will be visible to the user and your future self. This format is crucial for the experiment to work properly.
