@@ -1,0 +1,15 @@
+# API Configuration
+OPENROUTER_API_KEY = "Your API key goes here"
+
+# Models to test
+MODELS = [
+    #"anthropic/claude-sonnet-4",
+    #"openai/o1-mini-2024-09-12",
+    #"openai/gpt-4o-mini",
+    "tngtech/deepseek-r1t-chimera:free"
+]
+
+# Experiment Configuration
+NUM_ATTEMPTS = 3
+NUM_BRANCHES = 6
+MAX_TOKENS = 2000
