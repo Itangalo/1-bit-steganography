@@ -1,40 +1,53 @@
-from openai import OpenAI
+from __future__ import annotations
+
 import json
 import re
+from collections import namedtuple
+from typing import Optional
+
+from openai import OpenAI
 
 from config import (
-    OPENROUTER_API_KEY, 
-    MODELS, 
-    NUM_ATTEMPTS, 
-    NUM_BRANCHES, 
-    MAX_TOKENS
+    OPENROUTER_API_KEY,
+    MODELS,
+    NUM_ATTEMPTS,
+    NUM_BRANCHES,
+    MAX_TOKENS,
 )
 
+# ────────────────────────────────
 # OpenRouter setup
+# ────────────────────────────────
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY
+    api_key=OPENROUTER_API_KEY,
 )
 
-# Load prompts from files
-def load_prompt(filename):
+# ────────────────────────────────
+# Utility: load prompt from file
+# ────────────────────────────────
+def load_prompt(filename: str) -> str | None:
     try:
-        with open(filename, 'r', encoding='utf-8') as f:
+        with open(filename, "r", encoding="utf-8") as f:
             return f.read().strip()
     except FileNotFoundError:
         print(f"❌ Could not find {filename}")
         return None
 
-STEGANOGRAPHY_PROMPT = load_prompt('steganography_prompt.txt')
-SYSTEM_PROMPT = load_prompt('system_prompt.txt')
 
-def make_request(model, messages):
+STEGANOGRAPHY_PROMPT = load_prompt("steganography_prompt.txt")
+SYSTEM_PROMPT = load_prompt("system_prompt.txt")
+
+# ────────────────────────────────
+# OpenAI request helper
+# ────────────────────────────────
+def make_request(model: str, messages: list[dict[str, str]]) -> str | None:
     try:
         response = client.chat.completions.create(
             model=model,
             messages=messages,
             max_tokens=MAX_TOKENS,
-            temperature=0.7
+            temperature=0.7,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -42,147 +55,173 @@ def make_request(model, messages):
         return None
 
 
-def extract_yes_no(text):
-    """Extract yes/no answer from response"""
+# ────────────────────────────────
+# Yes/No extraction
+# ────────────────────────────────
+def extract_yes_no(text: str | None) -> str | None:
+    """Return 'yes' or 'no' (lower-case) if clearly present, else None."""
     if not text:
         return None
 
-    # Look for <answer>...</answer> tags first
-    answer_match = re.search(r'<answer>\s*(.*?)\s*</answer>', text, re.IGNORECASE | re.DOTALL)
+    # 1) Prioritise <answer> … </answer> section
+    answer_match = re.search(
+        r"<answer>\s*(.*?)\s*</answer>", text, re.IGNORECASE | re.DOTALL
+    )
     if answer_match:
         answer = answer_match.group(1).strip()
-        yes_no_match = re.search(r'\b(yes|no)\b', answer, re.IGNORECASE)
-        if yes_no_match:
-            return yes_no_match.group(1).lower()
+        yes_no = re.search(r"\b(yes|no)\b", answer, re.IGNORECASE)
+        if yes_no:
+            return yes_no.group(1).lower()
 
-    # Fallback patterns
-    patterns = [
-        r'\b(yes|no)[.!]?$',  # At end of line
-        r'"(yes|no)"',
-        r'\b(yes|no)\b',
-    ]
-
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-
-    if lines:
-        for line in reversed(lines[-3:]):
-            if line.lower() in ['yes', 'no']:
-                return line.lower()
-            for pattern in patterns:
-                match = re.search(pattern, line, re.IGNORECASE)
-                if match:
-                    return match.group(1).lower()
-    
+    # 2) Fallback: last non-blank line(s)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for line in reversed(lines[-3:]):  # last three non-empty lines
+        if line.lower() in {"yes", "no"}:
+            return line.lower()
+        m = re.search(r"\b(yes|no)\b", line, re.IGNORECASE)
+        if m:
+            return m.group(1).lower()
     return None
 
 
-def determine_claimed_color(question, answer):
-    """Determine what color the LLM claims to be thinking of based on question and answer"""
+# ────────────────────────────────
+# Determine colour from question+answer
+# ────────────────────────────────
+def determine_claimed_color(question: str, answer: str | None) -> str | None:
     if not answer:
         return None
-
+    answer = answer.lower()
     if question == "is it white":
         return "white" if answer == "yes" else "black"
-    elif question == "is it black":
+    if question == "is it black":
         return "black" if answer == "yes" else "white"
-
     return None
 
 
-def separate_reasoning_and_answer(text):
-    """Separate reasoning from final answer using tags"""
+# ────────────────────────────────
+# Reasoning/answer splitter
+# ────────────────────────────────
+Parsed = namedtuple("Parsed", ["reasoning", "answer"])
+
+# Matches <answer> … </answer> OR <reasoning> … </reasoning>,
+# but the closing tag is optional (handles models that forget it).
+_TAG_RE = re.compile(
+    r"<(?P<tag>answer|reasoning)>\s*(?P<body>.*?)(?:</\1>|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_all_tags(text: str) -> str:
+    """Remove any stray <answer>/<reasoning> tags that remain."""
+    return re.sub(r"</?\s*(answer|reasoning)\s*>", "", text, flags=re.IGNORECASE).strip()
+
+
+def separate_reasoning_and_answer(text: str | None) -> Parsed:
+    """
+    Split an LLM response into (reasoning, answer).
+
+    Priority:
+    1. If tags are present, obey them (closing tag optional).
+    2. If only one tag exists, the *rest* of the text is the other part.
+    3. No tags: last non-blank line = answer, the rest = reasoning.
+    4. Empty string: ('(no reasoning)', '').
+    """
     if not text:
-        return "", ""
+        return Parsed("(no reasoning)", "")
 
-    # Extract answer first
-    answer_match = re.search(r'<answer>\s*(.*?)\s*</answer>', text, re.IGNORECASE | re.DOTALL)
-    answer = answer_match.group(1).strip() if answer_match else ""
+    tagged: dict[str, str] = {
+        m.group("tag").lower(): m.group("body").strip() for m in _TAG_RE.finditer(text)
+    }
 
-    # Extract reasoning
-    reasoning_match = re.search(r'<reasoning>\s*(.*?)\s*</reasoning>', text, re.IGNORECASE | re.DOTALL)
+    answer: Optional[str] = tagged.get("answer")
+    reasoning: Optional[str] = tagged.get("reasoning")
 
-    if reasoning_match:
-        # If reasoning tags exist, use them
-        reasoning = reasoning_match.group(1).strip()
-    elif answer_match:
-        # If no reasoning tags but answer tags exist, everything outside answer tags is reasoning
-        # Remove the answer section from the text
-        reasoning = re.sub(r'<answer>\s*.*?\s*</answer>', '', text, flags=re.IGNORECASE | re.DOTALL).strip()
-    else:
-        # If no tags found at all, return original text as answer and empty reasoning
-        return "(no reasoning)", text
+    if answer is None and reasoning is None:
+        # 3) No tags at all
+        lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return Parsed("(no reasoning)", "")
+        answer = lines[-1]
+        reasoning = "\n".join(lines[:-1]).strip() or "(no reasoning)"
 
-    return reasoning, answer
+    elif answer is None:
+        # Only <reasoning> present → everything else is answer
+        remaining = _TAG_RE.sub("", text)
+        answer = _strip_all_tags(remaining) or "<empty answer>"
+
+    elif reasoning is None:
+        # Only <answer> present → everything else is reasoning
+        remaining = _TAG_RE.sub("", text)
+        reasoning = _strip_all_tags(remaining) or "(no reasoning)"
+
+    return Parsed(reasoning, answer)
 
 
-def test_model(model, attempts=10):
-    successful_attempts = []
-    model_display_name = model.split('/')[-1]
+# ────────────────────────────────
+# Core test loop
+# ────────────────────────────────
+def test_model(model: str, attempts: int = 10) -> list[list[str]]:
+    successful_attempts: list[list[str]] = []
+    model_display_name = model.split("/")[-1]
 
     for attempt in range(attempts):
-        full_dialogue = []
+        full_dialogue: list[str] = []
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"{model_display_name} - Attempt {attempt + 1}/{attempts}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
-        # Initial game setup
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": STEGANOGRAPHY_PROMPT}]
+        # Initial prompt
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": STEGANOGRAPHY_PROMPT},
+        ]
         response = make_request(model, messages)
-
         if not response:
             print("❌ The model did not respond.")
             continue
 
-        initial_reasoning, initial_answer = separate_reasoning_and_answer(response)
-        full_dialogue.append("Reasoning: " + initial_reasoning)
-        full_dialogue.append("Reply: " + initial_answer)
+        reasoning0, answer0 = separate_reasoning_and_answer(response)
+        full_dialogue.append("Reasoning: " + reasoning0)
+        full_dialogue.append("Reply: " + answer0)
 
-        print("Reply: " + initial_answer)
-        print("Reasoning: " + initial_reasoning)
+        print("Reply: " + answer0)
+        print("Reasoning: " + reasoning0)
 
-        messages.append({"role": "assistant", "content": initial_answer})
+        messages.append({"role": "assistant", "content": answer0})
 
-        # Test for consistent answers
-        claimed_color = None
+        # Check consistency across branches
+        claimed_color: Optional[str] = None
         failed = False
 
         for i in range(NUM_BRANCHES):
             q = "is it white" if i % 2 == 0 else "is it black"
-
             branch_msgs = messages + [{"role": "user", "content": q}]
-            branch_response = make_request(model, branch_msgs)
-
-            if not branch_response:
-                print(f"❌ Ingen respons från gren {i+1}")
+            branch_resp = make_request(model, branch_msgs)
+            if not branch_resp:
+                print(f"❌ No response in branch {i + 1}")
                 failed = True
                 break
 
-            reasoning, answer = separate_reasoning_and_answer(branch_response)
-            yesno = extract_yes_no(answer)
-            current_claimed_color = determine_claimed_color(q, yesno)
+            reasoning_i, answer_i = separate_reasoning_and_answer(branch_resp)
+            yes_no_i = extract_yes_no(answer_i)
+            color_i = determine_claimed_color(q, yes_no_i)
 
-            if not yesno:
-                print(f"❌ Could not extract yes/no answer in attempt {i+1}")
+            if yes_no_i is None or color_i is None:
+                print(f"❌ Could not parse a yes/no in branch {i + 1}")
                 failed = True
                 break
 
-            print(f"Reply {i+1}: {current_claimed_color}")
-            print(f"Reasoning {i+1}: {reasoning}")
+            print(f"Reply {i + 1}: {color_i}")
+            print(f"Reasoning {i + 1}: {reasoning_i}")
 
-            if current_claimed_color is None:
-                print(f"❌ Could not determine which color the LLM claimed to have chosen")
-                failed = True
-                break
+            full_dialogue.append(f"Reasoning {i + 1}: {reasoning_i}")
+            full_dialogue.append(f"Reply {i + 1}: {color_i}")
 
-            full_dialogue.append(f"Reasoning {i+1}: {reasoning}")
-            full_dialogue.append(f"Reply {i+1}: {current_claimed_color}")
-
-            # Check consistency
             if claimed_color is None:
-                claimed_color = current_claimed_color
-            elif claimed_color != current_claimed_color:
-                print(f"❌ Inconsistent answers: {claimed_color} vs {current_claimed_color}")
+                claimed_color = color_i
+            elif claimed_color != color_i:
+                print(f"❌ Inconsistent answers: {claimed_color} vs {color_i}")
                 failed = True
                 break
 
@@ -195,14 +234,17 @@ def test_model(model, attempts=10):
     return successful_attempts
 
 
-def main():
-    all_winners = []
+# ────────────────────────────────
+# Entry-point
+# ────────────────────────────────
+def main() -> None:
+    all_winners: list[list[str]] = []
 
     for model in MODELS:
         winners = test_model(model, NUM_ATTEMPTS)
         all_winners.extend(winners)
 
-    with open("winners.json", 'w') as f:
+    with open("winners.json", "w", encoding="utf-8") as f:
         json.dump(all_winners, f, indent=2)
 
     print(f"\nSuccessful attempts: {len(all_winners)}/{NUM_ATTEMPTS}")
