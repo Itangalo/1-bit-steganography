@@ -15,7 +15,7 @@ MODELS = [
 # Experiment Configuration
 NUM_ATTEMPTS   = 10
 NUM_BRANCHES   = 4
-MAX_TOKENS     = 256
+MAX_TOKENS     = 2000
 MAX_CONCURRENCY = 5
 
 # Logging
