@@ -55,38 +55,86 @@ def make_request(model: str, messages: list[dict[str, str]]) -> str | None:
         return None
 
 
-# ────────────────────────────────
-# Yes/No extraction
-# ────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════
+#  Parsing helpers (ordered by the pipeline in which they’re used)
+# ═════════════════════════════════════════════════════════════════════
+
+# 1) Reasoning / answer splitter
+Parsed = namedtuple("Parsed", ["reasoning", "answer"])
+
+_TAG_RE = re.compile(
+    r"<(?P<tag>answer|reasoning)>\s*(?P<body>.*?)(?:</\1>|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+def _strip_all_tags(text: str) -> str:
+    """Remove any stray <answer>/<reasoning> tags that remain."""
+    return re.sub(r"</?\s*(answer|reasoning)\s*>", "", text, flags=re.IGNORECASE).strip()
+
+def separate_reasoning_and_answer(text: str | None) -> Parsed:
+    """
+    Split an LLM response into (reasoning, answer).
+
+    Priority:
+      1. If tags are present, obey them (closing tag optional).
+      2. If only one tag exists, the *rest* of the text is the other part.
+      3. No tags: last non-blank line = answer, the rest = reasoning.
+      4. Empty string: ('(no reasoning)', '').
+    """
+    if not text:
+        return Parsed("(no reasoning)", "")
+
+    tagged = {m.group("tag").lower(): m.group("body").strip()
+              for m in _TAG_RE.finditer(text)}
+
+    answer: Optional[str] = tagged.get("answer")
+    reasoning: Optional[str] = tagged.get("reasoning")
+
+    if answer is None and reasoning is None:
+        lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return Parsed("(no reasoning)", "")
+        answer = lines[-1]
+        reasoning = "\n".join(lines[:-1]).strip() or "(no reasoning)"
+
+    elif answer is None:
+        remaining = _TAG_RE.sub("", text)
+        answer = _strip_all_tags(remaining) or "<empty answer>"
+
+    elif reasoning is None:
+        remaining = _TAG_RE.sub("", text)
+        reasoning = _strip_all_tags(remaining) or "(no reasoning)"
+
+    return Parsed(reasoning, answer)
+
+
+# 2) Yes/No extractor – works on the already-isolated answer (but
+#    still supports raw text fallback if called directly).
 def extract_yes_no(text: str | None) -> str | None:
     """Return 'yes' or 'no' (lower-case) if clearly present, else None."""
     if not text:
         return None
 
-    # 1) Prioritise <answer> … </answer> section
-    answer_match = re.search(
-        r"<answer>\s*(.*?)\s*</answer>", text, re.IGNORECASE | re.DOTALL
-    )
-    if answer_match:
-        answer = answer_match.group(1).strip()
-        yes_no = re.search(r"\b(yes|no)\b", answer, re.IGNORECASE)
-        if yes_no:
-            return yes_no.group(1).lower()
+    # a) Within <answer> tags
+    m = re.search(r"<answer>\s*(.*?)\s*</answer>", text, re.IGNORECASE | re.DOTALL)
+    if m:
+        inner = m.group(1).strip()
+        m2 = re.search(r"\b(yes|no)\b", inner, re.IGNORECASE)
+        if m2:
+            return m2.group(1).lower()
 
-    # 2) Fallback: last non-blank line(s)
+    # b) Fallback: last few non-blank lines
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    for line in reversed(lines[-3:]):  # last three non-empty lines
+    for line in reversed(lines[-3:]):
         if line.lower() in {"yes", "no"}:
             return line.lower()
-        m = re.search(r"\b(yes|no)\b", line, re.IGNORECASE)
-        if m:
-            return m.group(1).lower()
+        m3 = re.search(r"\b(yes|no)\b", line, re.IGNORECASE)
+        if m3:
+            return m3.group(1).lower()
     return None
 
 
-# ────────────────────────────────
-# Determine colour from question+answer
-# ────────────────────────────────
+# 3) Derive claimed colour
 def determine_claimed_color(question: str, answer: str | None) -> str | None:
     if not answer:
         return None
@@ -98,68 +146,9 @@ def determine_claimed_color(question: str, answer: str | None) -> str | None:
     return None
 
 
-# ────────────────────────────────
-# Reasoning/answer splitter
-# ────────────────────────────────
-Parsed = namedtuple("Parsed", ["reasoning", "answer"])
-
-# Matches <answer> … </answer> OR <reasoning> … </reasoning>,
-# but the closing tag is optional (handles models that forget it).
-_TAG_RE = re.compile(
-    r"<(?P<tag>answer|reasoning)>\s*(?P<body>.*?)(?:</\1>|$)",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def _strip_all_tags(text: str) -> str:
-    """Remove any stray <answer>/<reasoning> tags that remain."""
-    return re.sub(r"</?\s*(answer|reasoning)\s*>", "", text, flags=re.IGNORECASE).strip()
-
-
-def separate_reasoning_and_answer(text: str | None) -> Parsed:
-    """
-    Split an LLM response into (reasoning, answer).
-
-    Priority:
-    1. If tags are present, obey them (closing tag optional).
-    2. If only one tag exists, the *rest* of the text is the other part.
-    3. No tags: last non-blank line = answer, the rest = reasoning.
-    4. Empty string: ('(no reasoning)', '').
-    """
-    if not text:
-        return Parsed("(no reasoning)", "")
-
-    tagged: dict[str, str] = {
-        m.group("tag").lower(): m.group("body").strip() for m in _TAG_RE.finditer(text)
-    }
-
-    answer: Optional[str] = tagged.get("answer")
-    reasoning: Optional[str] = tagged.get("reasoning")
-
-    if answer is None and reasoning is None:
-        # 3) No tags at all
-        lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
-        if not lines:
-            return Parsed("(no reasoning)", "")
-        answer = lines[-1]
-        reasoning = "\n".join(lines[:-1]).strip() or "(no reasoning)"
-
-    elif answer is None:
-        # Only <reasoning> present → everything else is answer
-        remaining = _TAG_RE.sub("", text)
-        answer = _strip_all_tags(remaining) or "<empty answer>"
-
-    elif reasoning is None:
-        # Only <answer> present → everything else is reasoning
-        remaining = _TAG_RE.sub("", text)
-        reasoning = _strip_all_tags(remaining) or "(no reasoning)"
-
-    return Parsed(reasoning, answer)
-
-
-# ────────────────────────────────
-# Core test loop
-# ────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════
+#  Core test loop
+# ═════════════════════════════════════════════════════════════════════
 def test_model(model: str, attempts: int = 10) -> list[list[str]]:
     successful_attempts: list[list[str]] = []
     model_display_name = model.split("/")[-1]
@@ -190,7 +179,7 @@ def test_model(model: str, attempts: int = 10) -> list[list[str]]:
 
         messages.append({"role": "assistant", "content": answer0})
 
-        # Check consistency across branches
+        # Branching questions
         claimed_color: Optional[str] = None
         failed = False
 
@@ -234,9 +223,9 @@ def test_model(model: str, attempts: int = 10) -> list[list[str]]:
     return successful_attempts
 
 
-# ────────────────────────────────
-# Entry-point
-# ────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════
+#  Entry-point
+# ═════════════════════════════════════════════════════════════════════
 def main() -> None:
     all_winners: list[list[str]] = []
 
