@@ -110,7 +110,7 @@ def separate_reasoning_and_answer(text):
         reasoning = re.sub(r'<answer>\s*.*?\s*</answer>', '', text, flags=re.IGNORECASE | re.DOTALL).strip()
     else:
         # If no tags found at all, return original text as answer and empty reasoning
-        return "(empty)", text
+        return "(no reasoning)", text
 
     return reasoning, answer
 
@@ -131,7 +131,7 @@ def test_model(model, attempts=10):
         response = make_request(model, messages)
 
         if not response:
-            print("❌ Ingen respons från modellen")
+            print("❌ The model did not respond.")
             continue
 
         initial_reasoning, initial_answer = separate_reasoning_and_answer(response)
