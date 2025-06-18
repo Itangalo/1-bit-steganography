@@ -102,7 +102,7 @@ async def get_root_reply(model: str, idx: int, sem: asyncio.Semaphore) -> Attemp
     if not answer0.strip():
         answer0 = "<empty answer>"
 
-    print(f"Fetched root answer {idx}")                #  <── loggning direkt
+    print(f"Fetched root answer {idx}")
 
     msgs.append({"role": "assistant", "content": answer0})
     return AttemptRoot(msgs, answer0)
@@ -151,20 +151,26 @@ async def test_model(model: str, attempts: int) -> list[list[str]]:
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
     print(f"\n========== {model.split('/')[-1]} ==========")
 
+    # Phase A – samla root-svar
     roots = await asyncio.gather(
         *[asyncio.create_task(get_root_reply(model, i + 1, sem)) for i in range(attempts)]
     )
+
+    # Phase B – starta evaluation-tasks
     eval_tasks = [
         asyncio.create_task(evaluate_attempt(model, root, idx + 1, sem))
         for idx, root in enumerate(r for r in roots if r)
     ]
-    results = await asyncio.gather(*eval_tasks)
 
     winners: list[list[str]] = []
-    for log_block, dialogue in results:
+
+    # Skriv ut varje attempt-logg direkt när den är klar
+    for coro in asyncio.as_completed(eval_tasks):
+        log_block, dialogue = await coro
         print(log_block)
         if dialogue:
             winners.append(dialogue)
+
     return winners
 
 # ─────────────────────────── huvudprogram ────────────────────────────
