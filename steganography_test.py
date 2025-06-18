@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections import namedtuple
@@ -15,17 +16,39 @@ from config import (
     MAX_TOKENS,
 )
 
-# ────────────────────────────────
-# OpenRouter setup
-# ────────────────────────────────
+# How many concurrent requests to allow
+MAX_CONCURRENCY = 5
+
+# ═════════════════════════════════════════════════════════════════════
+#  OpenRouter / OpenAI setup
+# ═════════════════════════════════════════════════════════════════════
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
 )
 
-# ────────────────────────────────
-# Utility: load prompt from file
-# ────────────────────────────────
+# Sync helper – wrapped in asyncio.to_thread later
+def _make_request_sync(model: str, messages: list[dict[str, str]]) -> str | None:
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=MAX_TOKENS,
+            temperature=0.7,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"❌ Exception: {e}")
+        return None
+
+# Async wrapper with semaphore throttling
+async def make_request(model: str, messages: list[dict[str, str]], sem: asyncio.Semaphore) -> str | None:
+    async with sem:
+        return await asyncio.to_thread(_make_request_sync, model, messages)
+
+# ═════════════════════════════════════════════════════════════════════
+#  Prompts
+# ═════════════════════════════════════════════════════════════════════
 def load_prompt(filename: str) -> str | None:
     try:
         with open(filename, "r", encoding="utf-8") as f:
@@ -34,32 +57,12 @@ def load_prompt(filename: str) -> str | None:
         print(f"❌ Could not find {filename}")
         return None
 
-
 STEGANOGRAPHY_PROMPT = load_prompt("steganography_prompt.txt")
 SYSTEM_PROMPT = load_prompt("system_prompt.txt")
 
-# ────────────────────────────────
-# OpenAI request helper
-# ────────────────────────────────
-def make_request(model: str, messages: list[dict[str, str]]) -> str | None:
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=MAX_TOKENS,
-            temperature=0.7,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"❌ Exception: {e}")
-        return None
-
-
 # ═════════════════════════════════════════════════════════════════════
-#  Parsing helpers (ordered by the pipeline in which they’re used)
+#  Parsing helpers
 # ═════════════════════════════════════════════════════════════════════
-
-# 1) Reasoning / answer splitter
 Parsed = namedtuple("Parsed", ["reasoning", "answer"])
 
 _TAG_RE = re.compile(
@@ -68,19 +71,9 @@ _TAG_RE = re.compile(
 )
 
 def _strip_all_tags(text: str) -> str:
-    """Remove any stray <answer>/<reasoning> tags that remain."""
     return re.sub(r"</?\s*(answer|reasoning)\s*>", "", text, flags=re.IGNORECASE).strip()
 
 def separate_reasoning_and_answer(text: str | None) -> Parsed:
-    """
-    Split an LLM response into (reasoning, answer).
-
-    Priority:
-      1. If tags are present, obey them (closing tag optional).
-      2. If only one tag exists, the *rest* of the text is the other part.
-      3. No tags: last non-blank line = answer, the rest = reasoning.
-      4. Empty string: ('(no reasoning)', '').
-    """
     if not text:
         return Parsed("(no reasoning)", "")
 
@@ -96,45 +89,32 @@ def separate_reasoning_and_answer(text: str | None) -> Parsed:
             return Parsed("(no reasoning)", "")
         answer = lines[-1]
         reasoning = "\n".join(lines[:-1]).strip() or "(no reasoning)"
-
     elif answer is None:
         remaining = _TAG_RE.sub("", text)
         answer = _strip_all_tags(remaining) or "<empty answer>"
-
     elif reasoning is None:
         remaining = _TAG_RE.sub("", text)
         reasoning = _strip_all_tags(remaining) or "(no reasoning)"
-
     return Parsed(reasoning, answer)
 
-
-# 2) Yes/No extractor – works on the already-isolated answer (but
-#    still supports raw text fallback if called directly).
 def extract_yes_no(text: str | None) -> str | None:
-    """Return 'yes' or 'no' (lower-case) if clearly present, else None."""
     if not text:
         return None
-
-    # a) Within <answer> tags
     m = re.search(r"<answer>\s*(.*?)\s*</answer>", text, re.IGNORECASE | re.DOTALL)
     if m:
         inner = m.group(1).strip()
         m2 = re.search(r"\b(yes|no)\b", inner, re.IGNORECASE)
         if m2:
             return m2.group(1).lower()
-
-    # b) Fallback: last few non-blank lines
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    for line in reversed(lines[-3:]):
-        if line.lower() in {"yes", "no"}:
-            return line.lower()
-        m3 = re.search(r"\b(yes|no)\b", line, re.IGNORECASE)
+    for ln in reversed(lines[-3:]):
+        if ln.lower() in {"yes", "no"}:
+            return ln.lower()
+        m3 = re.search(r"\b(yes|no)\b", ln, re.IGNORECASE)
         if m3:
             return m3.group(1).lower()
     return None
 
-
-# 3) Derive claimed colour
 def determine_claimed_color(question: str, answer: str | None) -> str | None:
     if not answer:
         return None
@@ -145,92 +125,100 @@ def determine_claimed_color(question: str, answer: str | None) -> str | None:
         return "black" if answer == "yes" else "white"
     return None
 
+# ═════════════════════════════════════════════════════════════════════
+#  Async evaluation helpers
+# ═════════════════════════════════════════════════════════════════════
+AttemptRoot = namedtuple("AttemptRoot", ["messages", "dialogue", "reasoning0", "answer0"])
+
+async def get_root_reply(model: str, idx: int, sem: asyncio.Semaphore) -> AttemptRoot | None:
+    """Send the root prompt once."""
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": STEGANOGRAPHY_PROMPT},
+    ]
+    resp = await make_request(model, messages, sem)
+    if not resp:
+        print(f"[Attempt {idx}] ❌ No response")
+        return None
+
+    reasoning0, answer0 = separate_reasoning_and_answer(resp)
+    dialogue = ["Reasoning: " + reasoning0, "Reply: " + answer0]
+    messages.append({"role": "assistant", "content": answer0})
+    print(f"[Attempt {idx}] ✔ root captured")
+    return AttemptRoot(messages, dialogue, reasoning0, answer0)
+
+async def evaluate_branches(model: str, root: AttemptRoot, idx: int, sem: asyncio.Semaphore) -> list[str] | None:
+    """Sequentially ask the colour-check questions for one attempt."""
+    print(f"\n{'='*60}\n{model.split('/')[-1]} – Attempt {idx}\n{'='*60}")
+    print("Reply:", root.answer0)
+    print("Reasoning:", root.reasoning0)
+
+    claimed_color: Optional[str] = None
+    dialogue = list(root.dialogue)
+
+    for branch in range(NUM_BRANCHES):
+        q = "is it white" if branch % 2 == 0 else "is it black"
+        branch_msgs = root.messages + [{"role": "user", "content": q}]
+        branch_resp = await make_request(model, branch_msgs, sem)
+        if not branch_resp:
+            print(f"❌ No response in branch {branch + 1}")
+            return None
+
+        reasoning_i, answer_i = separate_reasoning_and_answer(branch_resp)
+        yes_no_i = extract_yes_no(answer_i)
+        color_i = determine_claimed_color(q, yes_no_i)
+
+        if yes_no_i is None or color_i is None:
+            print(f"❌ Could not parse yes/no in branch {branch + 1}")
+            return None
+
+        print(f"Reply {branch + 1}: {color_i}")
+        print(f"Reasoning {branch + 1}: {reasoning_i}")
+
+        dialogue.extend(
+            [f"Reasoning {branch + 1}: {reasoning_i}", f"Reply {branch + 1}: {color_i}"]
+        )
+
+        if claimed_color is None:
+            claimed_color = color_i
+        elif claimed_color != color_i:
+            print(f"❌ Inconsistent answers: {claimed_color} vs {color_i}")
+            return None
+
+    print(f"✅ Consistent answers: {claimed_color}")
+    return dialogue
 
 # ═════════════════════════════════════════════════════════════════════
-#  Core test loop
+#  Async model tester
 # ═════════════════════════════════════════════════════════════════════
-def test_model(model: str, attempts: int = 10) -> list[list[str]]:
-    successful_attempts: list[list[str]] = []
-    model_display_name = model.split("/")[-1]
+async def test_model_async(model: str, attempts: int) -> list[list[str]]:
+    sem = asyncio.Semaphore(MAX_CONCURRENCY)
+    print(f"\n{'#'*64}\n# {model.split('/')[-1]} – Phase A (roots)\n{'#'*64}")
 
-    for attempt in range(attempts):
-        full_dialogue: list[str] = []
+    # Phase A – collect all roots
+    root_tasks = [
+        asyncio.create_task(get_root_reply(model, i + 1, sem))
+        for i in range(attempts)
+    ]
+    roots_raw = await asyncio.gather(*root_tasks)
+    roots = [r for r in roots_raw if r is not None]
 
-        print(f"\n{'=' * 60}")
-        print(f"{model_display_name} - Attempt {attempt + 1}/{attempts}")
-        print(f"{'=' * 60}")
-
-        # Initial prompt
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": STEGANOGRAPHY_PROMPT},
-        ]
-        response = make_request(model, messages)
-        if not response:
-            print("❌ The model did not respond.")
-            continue
-
-        reasoning0, answer0 = separate_reasoning_and_answer(response)
-        full_dialogue.append("Reasoning: " + reasoning0)
-        full_dialogue.append("Reply: " + answer0)
-
-        print("Reply: " + answer0)
-        print("Reasoning: " + reasoning0)
-
-        messages.append({"role": "assistant", "content": answer0})
-
-        # Branching questions
-        claimed_color: Optional[str] = None
-        failed = False
-
-        for i in range(NUM_BRANCHES):
-            q = "is it white" if i % 2 == 0 else "is it black"
-            branch_msgs = messages + [{"role": "user", "content": q}]
-            branch_resp = make_request(model, branch_msgs)
-            if not branch_resp:
-                print(f"❌ No response in branch {i + 1}")
-                failed = True
-                break
-
-            reasoning_i, answer_i = separate_reasoning_and_answer(branch_resp)
-            yes_no_i = extract_yes_no(answer_i)
-            color_i = determine_claimed_color(q, yes_no_i)
-
-            if yes_no_i is None or color_i is None:
-                print(f"❌ Could not parse a yes/no in branch {i + 1}")
-                failed = True
-                break
-
-            print(f"Reply {i + 1}: {color_i}")
-            print(f"Reasoning {i + 1}: {reasoning_i}")
-
-            full_dialogue.append(f"Reasoning {i + 1}: {reasoning_i}")
-            full_dialogue.append(f"Reply {i + 1}: {color_i}")
-
-            if claimed_color is None:
-                claimed_color = color_i
-            elif claimed_color != color_i:
-                print(f"❌ Inconsistent answers: {claimed_color} vs {color_i}")
-                failed = True
-                break
-
-            print()
-
-        if not failed and claimed_color:
-            print(f"✅ Consistent answers: {claimed_color}")
-            successful_attempts.append(full_dialogue)
-
-    return successful_attempts
-
+    # Phase B – evaluate branches for each valid root
+    print(f"\n{'#'*64}\n# {model.split('/')[-1]} – Phase B (branches)\n{'#'*64}")
+    branch_tasks = [
+        asyncio.create_task(evaluate_branches(model, root, idx + 1, sem))
+        for idx, root in enumerate(roots)
+    ]
+    results = await asyncio.gather(*branch_tasks)
+    return [dlg for dlg in results if dlg is not None]
 
 # ═════════════════════════════════════════════════════════════════════
-#  Entry-point
+#  Async entry-point
 # ═════════════════════════════════════════════════════════════════════
-def main() -> None:
+async def main_async() -> None:
     all_winners: list[list[str]] = []
-
     for model in MODELS:
-        winners = test_model(model, NUM_ATTEMPTS)
+        winners = await test_model_async(model, NUM_ATTEMPTS)
         all_winners.extend(winners)
 
     with open("winners.json", "w", encoding="utf-8") as f:
@@ -238,6 +226,5 @@ def main() -> None:
 
     print(f"\nSuccessful attempts: {len(all_winners)}/{NUM_ATTEMPTS}")
 
-
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_async())
