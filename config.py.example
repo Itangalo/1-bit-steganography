@@ -2,21 +2,21 @@
 OPENROUTER_API_KEY = "Your API key goes here"
 
 # Models to test
-MODELS = [
+ENCODING_MODELS = [
     #"anthropic/claude-sonnet-4",
     #"openai/o1-mini-2024-09-12",
     #"openai/gpt-4o-mini",
-    #"tngtech/deepseek-r1t-chimera:free"
-    #"openai/codex-mini"
-    #"google/gemini-2.5-pro-preview"
-    "openai/gpt-4o-2024-11-20"
+    "tngtech/deepseek-r1t-chimera:free"
+]
+
+DECODING_MODELS = [
+    #"anthropic/claude-sonnet-4",
+    #"openai/o1-mini-2024-09-12",
+    #"openai/gpt-4o-mini",
+    "tngtech/deepseek-r1t-chimera:free"
 ]
 
 # Experiment Configuration
-NUM_ATTEMPTS   = 10
-NUM_BRANCHES   = 4
-MAX_TOKENS     = 2000
-MAX_CONCURRENCY = 5
-
-# Logging
-LOG_DIR = "logs"
+NUM_ATTEMPTS = 3
+NUM_BRANCHES = 6
+MAX_TOKENS = 2000
