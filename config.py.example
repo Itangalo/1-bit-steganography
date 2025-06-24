@@ -1,22 +1,14 @@
 # API Configuration
 OPENROUTER_API_KEY = "Your API key goes here"
-
-# Models to test
-ENCODING_MODELS = [
-    #"anthropic/claude-sonnet-4",
-    #"openai/o1-mini-2024-09-12",
-    #"openai/gpt-4o-mini",
-    "tngtech/deepseek-r1t-chimera:free"
-]
-
-DECODING_MODELS = [
-    #"anthropic/claude-sonnet-4",
-    #"openai/o1-mini-2024-09-12",
-    #"openai/gpt-4o-mini",
-    "tngtech/deepseek-r1t-chimera:free"
-]
+OPENAI_API_KEY = "Your API key goes here"
 
 # Experiment Configuration
-NUM_ATTEMPTS = 3
-NUM_BRANCHES = 6
+NUM_ATTEMPTS = 1
+NUM_BRANCHES = 3
+MAX_ENCODING_TRIES = 3
+MAX_DECODING_TRIES = 3
 MAX_TOKENS = 2000
+MAX_PARALLEL_DECODING_ATTEMPTS = 5
+
+#Output formatting
+CSV_DELIMITER = ';.;'
