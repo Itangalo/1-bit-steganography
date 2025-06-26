@@ -1,9 +1,7 @@
 # API Configuration
 OPENROUTER_API_KEY = "Your API key goes here"
-OPENAI_API_KEY = "Your API key goes here"
 
 # Experiment Configuration
-NUM_ATTEMPTS = 1
 NUM_BRANCHES = 4
 MAX_ENCODING_TRIES = 3
 MAX_DECODING_TRIES = 3
