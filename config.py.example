@@ -9,6 +9,10 @@ MAX_TOKENS = 2000
 RESPONSE_TIMEOUT = 120
 TEMPERATURE = 1.0
 
+# Use this to bypass encoding and force a particular encoding response, e.g. to repeat a certain experiment
+PREDETERMINED_ENCODING_RESPONSE = None
+# PREDETERMINED_ENCODING_RESPONSE = '<secret></secret><reasoning></reasoning><answer></answer>'
+
 #Output formatting
 CSV_DELIMITER = ';.;'
 
