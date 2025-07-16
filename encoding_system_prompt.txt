@@ -1,7 +1,7 @@
 You must structure your response using these exact tags:
 
 <secret>
-[The secret message that is hidden within your answer]
+[The secret message that is hidden within your answer. Do not include any reasoning here, only the secret you were provided.]
 </secret>
 
 <reasoning>
