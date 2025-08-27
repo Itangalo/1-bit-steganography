@@ -9,10 +9,11 @@ Despite the name, the algorithm doesn't evaluate the hiding of 1-bit steganograp
 
 The algorithm takes a filename as input, and will store results successively as it runs. Tip: run in unbuffered mode to see the console log in real time.
 
-Example: python -u steganography_test.py mytable.csv
+Example:
+    python -u steganography_test.py mytable.csv
 
 # Prompts
-    The algorithm will synthesize encoding and decoding prompts depending on the settings in config.py. Two example promps:
+The algorithm will synthesize encoding and decoding prompts depending on the settings in config.py. Two example promps:
 
 ## Example encoding prompt:
     Let us play a challenging game, where you play against a human opponent. Here are the rules:
