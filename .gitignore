@@ -2,5 +2,6 @@ config.py
 winners.json
 __pycache__/
 *.pyc
+*.csv
 .env
 /logs/
